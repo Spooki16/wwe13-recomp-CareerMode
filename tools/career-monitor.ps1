@@ -34,8 +34,18 @@ function Show-Event($e, [string]$line) {
     "cinematic_end"    { }
     "scan_reset"       { Write-Host "$time  Scan: started over" -ForegroundColor White }
     "scan_mark"        { Write-Host "$time  Scan: marked $($e.state)  (A x$($e.marks_a), B x$($e.marks_b))  candidates: $($e.candidates)  [$($e.scan_seconds) s]" -ForegroundColor White }
-    "scan_list"        { Write-Host "$time  Scan: $($e.candidates) candidate(s) $($e.note)" -ForegroundColor White }
-    "scan_candidate"   { Write-Host "            $($e.address)   A=$($e.a)   B=$($e.b)" -ForegroundColor White }
+    "scan_list"        {
+      if ($e.file) {
+        Write-Host "$time  Scan: $($e.candidates) candidate(s): $($e.flag_like) flag-like; $($e.image) in game globals, $($e.heap) in heaps, $($e.physical) in GPU memory" -ForegroundColor White
+        Write-Host "            full list saved to logs\$($e.file); best candidates:" -ForegroundColor White
+      } else {
+        Write-Host "$time  Scan: $($e.candidates) candidate(s) $($e.note)" -ForegroundColor White
+      }
+    }
+    "scan_candidate"   {
+      $tag = if ($e.flag_like) { "flag-like" } else { "" }
+      Write-Host ("            {0}   A={1}   B={2}   {3,-8} {4}" -f $e.address, $e.a, $e.b, $e.range, $tag) -ForegroundColor White
+    }
     "scan_error"       { Write-Host "$time  Scan error: $($e.reason)" -ForegroundColor Red }
     default            { Write-Host "$time  $line" -ForegroundColor DarkGray }
   }

@@ -18,6 +18,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -153,13 +156,96 @@ size_t CountAlive(const Scan& scan) {
   return alive;
 }
 
-void Report(const Scan& scan, size_t limit) {
-  const size_t shown = std::min(limit, scan.candidates.size());
-  for (size_t i = 0; i < shown; ++i) {
-    const Candidate& c = scan.candidates[i];
-    Emit("scan_candidate", fmt::format(R"("address":"0x{:08X}","a":"0x{:08X}","b":"0x{:08X}")", c.address,
-                                       SwapBe(c.value[0]), SwapBe(c.value[1])));
+// True if the two values differ in exactly one byte and that byte is small (0-15) in both: what a bool, an enum or a
+// small counter looks like. Test show: the pause scan plateaued at ~13,000 candidates, most of them pause-menu
+// graphics; flag-like words sort first so the real flag isn't buried.
+bool FlagLike(const Candidate& c) {
+  const uint32_t a = SwapBe(c.value[0]);
+  const uint32_t b = SwapBe(c.value[1]);
+  const uint32_t diff = a ^ b;
+  for (int shift = 0; shift < 32; shift += 8) {
+    if ((diff & ~(0xFFu << shift)) == 0) {
+      return ((a >> shift) & 0xFF) <= 0x0F && ((b >> shift) & 0xFF) <= 0x0F;
+    }
   }
+  return false;
+}
+
+// 0 = XEX image heaps (the game's globals), 1 = other virtual heaps, 2 = physical memory (mostly GPU data).
+int RangeRank(uint32_t address) {
+  if (address >= 0x80000000u && address < 0xA0000000u) return 0;
+  if (address < 0x70000000u) return 1;
+  return 2;
+}
+
+const char* RangeName(uint32_t address) {
+  switch (RangeRank(address)) {
+    case 0: return "image";
+    case 1: return "heap";
+    default: return "physical";
+  }
+}
+
+// Candidates in the order worth checking: flag-like first, then globals before heaps before GPU memory.
+std::vector<Candidate> Ranked(const Scan& scan) {
+  std::vector<Candidate> ranked = scan.candidates;
+  std::stable_sort(ranked.begin(), ranked.end(), [](const Candidate& x, const Candidate& y) {
+    const bool fx = FlagLike(x), fy = FlagLike(y);
+    if (fx != fy) return fx;
+    const int rx = RangeRank(x.address), ry = RangeRank(y.address);
+    if (rx != ry) return rx < ry;
+    return x.address < y.address;
+  });
+  return ranked;
+}
+
+void Report(const Scan& scan, size_t limit) {
+  const std::vector<Candidate> ranked = Ranked(scan);
+  const size_t shown = std::min(limit, ranked.size());
+  for (size_t i = 0; i < shown; ++i) {
+    const Candidate& c = ranked[i];
+    Emit("scan_candidate", fmt::format(R"("address":"0x{:08X}","a":"0x{:08X}","b":"0x{:08X}","range":"{}","flag_like":{})",
+                                       c.address, SwapBe(c.value[0]), SwapBe(c.value[1]), RangeName(c.address),
+                                       FlagLike(c) ? "true" : "false"));
+  }
+}
+
+// The game's logs folder (next to wwe13.exe), where the full candidate list is saved.
+std::filesystem::path LogsDir() {
+#ifdef _WIN32
+  wchar_t buffer[MAX_PATH] = {};
+  const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+  if (length > 0 && length < MAX_PATH) {
+    return std::filesystem::path(buffer).parent_path() / "logs";
+  }
+#endif
+  return std::filesystem::current_path() / "logs";
+}
+
+// Writes every candidate, ranked, to logs/career-scan-<time>.txt and returns the file name ("" on failure).
+std::string DumpCandidates(const Scan& scan) {
+  const std::time_t now = std::time(nullptr);
+  std::tm local{};
+#ifdef _WIN32
+  localtime_s(&local, &now);
+#else
+  localtime_r(&now, &local);
+#endif
+  char stamp[32];
+  std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
+  const std::filesystem::path path = LogsDir() / (std::string("career-scan-") + stamp + ".txt");
+  std::ofstream out(path);
+  if (!out) {
+    return {};
+  }
+  out << "# WWE 13 career scan: words with one value in every A mark and another in every B mark\n";
+  out << "# marks_a=" << scan.marks[0] << " marks_b=" << scan.marks[1] << " candidates=" << scan.candidates.size()
+      << "\n# address a b range flag_like (values as the game reads them)\n";
+  for (const Candidate& c : Ranked(scan)) {
+    out << fmt::format("0x{:08X} 0x{:08X} 0x{:08X} {} {}\n", c.address, SwapBe(c.value[0]), SwapBe(c.value[1]),
+                       RangeName(c.address), FlagLike(c) ? 1 : 0);
+  }
+  return path.filename().string();
 }
 
 // Turns the surviving words into a candidate list and frees the snapshots.
@@ -271,7 +357,15 @@ void SwitchToList(Scan& scan) {
                                   CountAlive(g_scan)));
     return;
   }
-  Emit("scan_list", fmt::format(R"("candidates":{})", g_scan.candidates.size()));
+  size_t flag_like = 0;
+  size_t by_range[3] = {0, 0, 0};
+  for (const Candidate& c : g_scan.candidates) {
+    flag_like += FlagLike(c) ? 1 : 0;
+    ++by_range[RangeRank(c.address)];
+  }
+  const std::string file = DumpCandidates(g_scan);
+  Emit("scan_list", fmt::format(R"("candidates":{},"flag_like":{},"image":{},"heap":{},"physical":{},"file":"{}")",
+                                g_scan.candidates.size(), flag_like, by_range[0], by_range[1], by_range[2], file));
   Report(g_scan, kReportMax);
 }
 
