@@ -95,8 +95,12 @@ bool SafeCopy(void* destination, const void* source, size_t bytes) {
 #endif
 }
 
+// The scanner runs on its own host thread, which has no guest ThreadState, so it must not use REX_KERNEL_STATE():
+// that reads the calling thread's PPC context and crashed the game (null context, fault at 0xAC0) on the first F7.
+// The runtime singleton is safe from any thread.
 rex::memory::Memory* GuestMemory() {
-  rex::system::KernelState* const kernel_state = REX_KERNEL_STATE();
+  rex::Runtime* const runtime = rex::Runtime::instance();
+  rex::system::KernelState* const kernel_state = runtime ? runtime->kernel_state() : nullptr;
   return kernel_state ? kernel_state->memory() : nullptr;
 }
 
