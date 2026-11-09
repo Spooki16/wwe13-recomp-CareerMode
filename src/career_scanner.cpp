@@ -45,6 +45,7 @@ namespace {
 
 constexpr size_t kListThreshold = 200000;  // survivors below this switch to a candidate list
 constexpr size_t kReportMax = 40;          // candidates written out by F9 or when the list gets this short
+constexpr size_t kPointerSearchMax = 8;    // F9 searches for pointer paths when this few candidates remain
 
 struct Range {
   uint32_t low;
@@ -223,30 +224,6 @@ std::filesystem::path LogsDir() {
 }
 
 // Writes every candidate, ranked, to logs/career-scan-<time>.txt and returns the file name ("" on failure).
-std::string DumpCandidates(const Scan& scan) {
-  const std::time_t now = std::time(nullptr);
-  std::tm local{};
-#ifdef _WIN32
-  localtime_s(&local, &now);
-#else
-  localtime_r(&now, &local);
-#endif
-  char stamp[32];
-  std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
-  const std::filesystem::path path = LogsDir() / (std::string("career-scan-") + stamp + ".txt");
-  std::ofstream out(path);
-  if (!out) {
-    return {};
-  }
-  out << "# WWE 13 career scan: words with one value in every A mark and another in every B mark\n";
-  out << "# marks_a=" << scan.marks[0] << " marks_b=" << scan.marks[1] << " candidates=" << scan.candidates.size()
-      << "\n# address a b range flag_like (values as the game reads them)\n";
-  for (const Candidate& c : Ranked(scan)) {
-    out << fmt::format("0x{:08X} 0x{:08X} 0x{:08X} {} {}\n", c.address, SwapBe(c.value[0]), SwapBe(c.value[1]),
-                       RangeName(c.address), FlagLike(c) ? 1 : 0);
-  }
-  return path.filename().string();
-}
 
 // Turns the surviving words into a candidate list and frees the snapshots.
 void SwitchToList(Scan& scan) {
@@ -350,6 +327,163 @@ void SwitchToList(Scan& scan) {
   Emit("scan_reset");
 }
 
+// ---- Pointer search -------------------------------------------------------------------------------------------
+// A value found by a scan usually lives in an object the game allocates fresh each session, so its address changes
+// (the first pause candidate held animation data in the next session). What stays put is a pointer in the game's
+// globals (the XEX image heaps) that leads to the object. For each candidate this finds:
+//   level 1:  global G such that  [G] + offset == candidate
+//   level 2:  global G such that  [[G] + o1] + o2 == candidate   (one object in between)
+// Offsets are limited to kMaxPointerOffset. Physical memory is visible at 0xA0000000, 0xC0000000 and 0xE0000000;
+// pointers into any of those views are compared by physical address.
+
+constexpr uint32_t kMaxPointerOffset = 0x2000;
+constexpr size_t kMaxIntermediates = 8192;
+constexpr size_t kMaxPointerResults = 200;
+
+bool IsPhysicalView(uint32_t address) { return address >= 0xA0000000u; }
+
+// If `pointer` points at or below `target` by at most kMaxPointerOffset, returns true and the offset.
+bool PointsNear(uint32_t pointer, uint32_t target, uint32_t* offset) {
+  uint32_t p = pointer, t = target;
+  if (IsPhysicalView(p) && IsPhysicalView(t)) {
+    p &= 0x1FFFFFFFu;
+    t &= 0x1FFFFFFFu;
+  } else if (IsPhysicalView(p) != IsPhysicalView(t)) {
+    return false;
+  }
+  if (p == 0 || p > t || t - p > kMaxPointerOffset) {
+    return false;
+  }
+  *offset = t - p;
+  return true;
+}
+
+struct PointerPath {
+  uint32_t candidate;
+  uint32_t global;
+  std::vector<uint32_t> offsets;  // [G] + offsets[0] (level 1); [[G] + offsets[0]] + offsets[1] (level 2)
+};
+
+// Calls visit(address, value) for every aligned word in `regions` (values as the game reads them).
+template <typename Visit>
+void ForEachWord(rex::memory::Memory* memory, const std::vector<Region>& regions, Visit visit) {
+  std::vector<uint32_t> buffer;
+  for (const Region& region : regions) {
+    buffer.resize(region.size / 4);
+    if (!SafeCopy(buffer.data(), memory->TranslateVirtual<const uint8_t*>(region.base), region.size)) {
+      continue;
+    }
+    for (size_t w = 0; w < buffer.size(); ++w) {
+      visit(region.base + static_cast<uint32_t>(w * 4), SwapBe(buffer[w]));
+    }
+  }
+}
+
+std::vector<PointerPath> FindPointerPaths(rex::memory::Memory* memory, const std::vector<Candidate>& candidates) {
+  std::vector<PointerPath> paths;
+  const std::vector<Region> all = FindRegions(memory);
+  std::vector<Region> globals;
+  for (const Region& region : all) {
+    if (RangeRank(region.base) == 0) {
+      Region copy;
+      copy.base = region.base;
+      copy.size = region.size;
+      globals.push_back(std::move(copy));
+    }
+  }
+
+  // Level 1: globals that point straight at (or just below) a candidate.
+  ForEachWord(memory, globals, [&](uint32_t address, uint32_t value) {
+    for (const Candidate& c : candidates) {
+      uint32_t offset = 0;
+      if (paths.size() < kMaxPointerResults && PointsNear(value, c.address, &offset)) {
+        paths.push_back({c.address, address, {offset}});
+      }
+    }
+  });
+
+  // Level 2: words anywhere that point near a candidate (intermediates), then globals that point near those.
+  struct Intermediate {
+    uint32_t address;  // where the pointer to the candidate's object is stored
+    uint32_t key;      // that address, physical-normalised, for matching
+    uint32_t offset;   // candidate - pointer
+    uint32_t candidate;
+  };
+  std::vector<Intermediate> intermediates;
+  ForEachWord(memory, all, [&](uint32_t address, uint32_t value) {
+    if (intermediates.size() >= kMaxIntermediates) {
+      return;
+    }
+    for (const Candidate& c : candidates) {
+      uint32_t offset = 0;
+      if (PointsNear(value, c.address, &offset)) {
+        intermediates.push_back({address, IsPhysicalView(address) ? (address & 0x1FFFFFFFu) : address, offset,
+                                 c.address});
+      }
+    }
+  });
+  std::sort(intermediates.begin(), intermediates.end(),
+            [](const Intermediate& x, const Intermediate& y) { return x.key < y.key; });
+  ForEachWord(memory, globals, [&](uint32_t address, uint32_t value) {
+    if (value == 0 || paths.size() >= kMaxPointerResults) {
+      return;
+    }
+    const bool physical = IsPhysicalView(value);
+    const uint32_t low = physical ? (value & 0x1FFFFFFFu) : value;
+    const uint64_t high = uint64_t(low) + kMaxPointerOffset;
+    auto it = std::lower_bound(intermediates.begin(), intermediates.end(), low,
+                               [](const Intermediate& x, uint32_t key) { return x.key < key; });
+    for (; it != intermediates.end() && it->key <= high && paths.size() < kMaxPointerResults; ++it) {
+      if (IsPhysicalView(it->address) != physical) {
+        continue;
+      }
+      paths.push_back({it->candidate, address, {it->key - low, it->offset}});
+    }
+  });
+  return paths;
+}
+
+std::string FormatPath(const PointerPath& path) {
+  std::string text = fmt::format("[0x{:08X}]", path.global);
+  for (size_t i = 0; i < path.offsets.size(); ++i) {
+    text = (i == 0 ? text : "[" + text + "]") + fmt::format("+0x{:X}", path.offsets[i]);
+  }
+  return text;
+}
+
+std::string DumpCandidates(const Scan& scan, const std::vector<PointerPath>& paths) {
+  const std::time_t now = std::time(nullptr);
+  std::tm local{};
+#ifdef _WIN32
+  localtime_s(&local, &now);
+#else
+  localtime_r(&now, &local);
+#endif
+  char stamp[32];
+  std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
+  const std::filesystem::path path = LogsDir() / (std::string("career-scan-") + stamp + ".txt");
+  std::ofstream out(path);
+  if (!out) {
+    return {};
+  }
+  out << "# WWE 13 career scan: words with one value in every A mark and another in every B mark\n";
+  out << "# marks_a=" << scan.marks[0] << " marks_b=" << scan.marks[1] << " candidates=" << scan.candidates.size()
+      << "\n# address a b range flag_like (values as the game reads them)\n";
+  for (const Candidate& c : Ranked(scan)) {
+    out << fmt::format("0x{:08X} 0x{:08X} 0x{:08X} {} {}\n", c.address, SwapBe(c.value[0]), SwapBe(c.value[1]),
+                       RangeName(c.address), FlagLike(c) ? 1 : 0);
+  }
+  if (!paths.empty()) {
+    out << "# pointer paths from the game's globals: [G]+o means the value at G, plus o\n";
+    for (const PointerPath& p : paths) {
+      out << fmt::format("pointer 0x{:08X} {}\n", p.candidate, FormatPath(p));
+    }
+  }
+  return path.filename().string();
+}
+
+std::vector<PointerPath> g_last_paths;  // from the last F9, for F10
+
 [[maybe_unused]] void ListCandidates() {
   std::lock_guard<std::mutex> lock(g_scan_mutex);
   if (!g_scan.list_mode) {
@@ -363,10 +497,24 @@ void SwitchToList(Scan& scan) {
     flag_like += FlagLike(c) ? 1 : 0;
     ++by_range[RangeRank(c.address)];
   }
-  const std::string file = DumpCandidates(g_scan);
+  std::vector<PointerPath> paths;
+  if (g_scan.candidates.size() <= kPointerSearchMax) {
+    if (rex::memory::Memory* const memory = GuestMemory()) {
+      paths = FindPointerPaths(memory, g_scan.candidates);
+    }
+  }
+  g_last_paths = paths;
+  const std::string file = DumpCandidates(g_scan, paths);
   Emit("scan_list", fmt::format(R"("candidates":{},"flag_like":{},"image":{},"heap":{},"physical":{},"file":"{}")",
                                 g_scan.candidates.size(), flag_like, by_range[0], by_range[1], by_range[2], file));
   Report(g_scan, kReportMax);
+  if (g_scan.candidates.size() <= kPointerSearchMax) {
+    Emit("scan_pointers", fmt::format(R"("count":{})", paths.size()));
+    for (size_t i = 0; i < paths.size() && i < kReportMax; ++i) {
+      Emit("scan_pointer", fmt::format(R"("candidate":"0x{:08X}","path":"{}","levels":{})", paths[i].candidate,
+                                       FormatPath(paths[i]), paths[i].offsets.size()));
+    }
+  }
 }
 
 #ifdef _WIN32
@@ -377,42 +525,96 @@ bool GameWindowFocused() {
   return window && process == GetCurrentProcessId();
 }
 
-// Live watches: addresses read every tick, with each change sent as a "watch" event. Used to confirm a scan result
-// (does it flip exactly when the state does, and nothing else?) and to check whether it keeps its address in a new
-// session. The default is the pause-flag candidate from the first successful pause scan.
+// Live watches: values read every tick, with each change sent as a "watch" event. Used to confirm a scan result
+// (does it flip exactly when the state does, and nothing else?). A watch is either a plain address or a pointer path
+// from the game's globals ([G]+o, [[G]+o1]+o2), which finds the value again in every session.
+//
+// A watch that changes on almost every read (animation data, a timer) would flood the log, so after kNoisyChanges
+// changes within one second it is reported once as noisy and muted for a second.
 struct Watch {
-  uint32_t address;
+  uint32_t global;                // plain address, or the global the pointer path starts from
+  std::vector<uint32_t> offsets;  // empty for a plain address
   uint32_t last = 0;
   bool has_last = false;
+  int changes_this_second = 0;
+  std::chrono::steady_clock::time_point second_start{};
+  std::chrono::steady_clock::time_point muted_until{};
 };
-std::vector<Watch> g_watches = {
-    {0xAE37D3A8u},  // pause scan 2026-11-10: 2 while playing, 0 while paused (14 A / 11 B marks)
-};
+std::vector<Watch> g_watches;  // none by default: the first pause candidate moved in the next session
 constexpr size_t kMaxWatches = 8;
+constexpr int kNoisyChanges = 5;
+
+std::string WatchName(const Watch& watch) {
+  if (watch.offsets.empty()) {
+    return fmt::format("0x{:08X}", watch.global);
+  }
+  PointerPath path{0, watch.global, watch.offsets};
+  return FormatPath(path);
+}
+
+// Follows the watch's pointer path; returns false if a pointer on the way is null or unreadable.
+bool ResolveWatch(rex::memory::Memory* memory, const Watch& watch, uint32_t* address) {
+  uint32_t current = watch.global;
+  for (uint32_t offset : watch.offsets) {
+    uint32_t raw = 0;
+    if (!SafeCopy(&raw, memory->TranslateVirtual<const uint8_t*>(current), 4)) {
+      return false;
+    }
+    const uint32_t pointer = SwapBe(raw);
+    if (pointer == 0) {
+      return false;
+    }
+    current = pointer + offset;
+  }
+  *address = current;
+  return true;
+}
 
 void PollWatches() {
   rex::memory::Memory* const memory = GuestMemory();
   if (!memory) {
     return;
   }
+  const auto now = std::chrono::steady_clock::now();
   for (Watch& watch : g_watches) {
+    uint32_t address = 0;
     uint32_t raw = 0;
-    if (!SafeCopy(&raw, memory->TranslateVirtual<const uint8_t*>(watch.address), 4)) {
+    if (!ResolveWatch(memory, watch, &address) ||
+        !SafeCopy(&raw, memory->TranslateVirtual<const uint8_t*>(address), 4)) {
       continue;
     }
     const uint32_t value = SwapBe(raw);
-    if (!watch.has_last) {
-      Emit("watch", fmt::format(R"("address":"0x{:08X}","value":{},"first":true)", watch.address, value));
-    } else if (value != watch.last) {
-      Emit("watch", fmt::format(R"("address":"0x{:08X}","value":{},"previous":{})", watch.address, value,
-                                watch.last));
-    }
+    const bool changed = !watch.has_last || value != watch.last;
+    const uint32_t previous = watch.last;
     watch.last = value;
+    if (!changed) {
+      watch.has_last = true;
+      continue;
+    }
+    if (now - watch.second_start >= std::chrono::seconds(1)) {
+      watch.second_start = now;
+      watch.changes_this_second = 0;
+    }
+    if (++watch.changes_this_second == kNoisyChanges) {
+      Emit("watch_noisy", fmt::format(R"("watch":"{}")", WatchName(watch)));
+      watch.muted_until = now + std::chrono::seconds(1);
+    }
+    if (now < watch.muted_until) {
+      watch.has_last = true;
+      continue;
+    }
+    if (!watch.has_last) {
+      Emit("watch", fmt::format(R"("watch":"{}","address":"0x{:08X}","value":{},"first":true)", WatchName(watch),
+                                address, value));
+    } else {
+      Emit("watch", fmt::format(R"("watch":"{}","address":"0x{:08X}","value":{},"previous":{})", WatchName(watch),
+                                address, value, previous));
+    }
     watch.has_last = true;
   }
 }
 
-// F10: watch the best-ranked scan candidate.
+// F10: watch the best-ranked scan candidate, through a pointer path when F9 found one (level 1 preferred).
 void WatchTopCandidate() {
   std::lock_guard<std::mutex> lock(g_scan_mutex);
   if (!g_scan.list_mode || g_scan.candidates.empty()) {
@@ -420,16 +622,23 @@ void WatchTopCandidate() {
     return;
   }
   const uint32_t address = Ranked(g_scan).front().address;
-  for (const Watch& watch : g_watches) {
-    if (watch.address == address) {
+  Watch watch{address, {}};
+  for (const PointerPath& path : g_last_paths) {
+    if (path.candidate == address && (watch.offsets.empty() || path.offsets.size() < watch.offsets.size())) {
+      watch.global = path.global;
+      watch.offsets = path.offsets;
+    }
+  }
+  for (const Watch& existing : g_watches) {
+    if (existing.global == watch.global && existing.offsets == watch.offsets) {
       return;
     }
   }
   if (g_watches.size() >= kMaxWatches) {
     g_watches.erase(g_watches.begin());
   }
-  g_watches.push_back({address});
-  Emit("watch_added", fmt::format(R"("address":"0x{:08X}")", address));
+  g_watches.push_back(watch);
+  Emit("watch_added", fmt::format(R"("watch":"{}")", WatchName(watch)));
 }
 
 void BackgroundThread() {

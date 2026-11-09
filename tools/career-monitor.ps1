@@ -47,10 +47,13 @@ function Show-Event($e, [string]$line) {
       Write-Host ("            {0}   A={1}   B={2}   {3,-8} {4}" -f $e.address, $e.a, $e.b, $e.range, $tag) -ForegroundColor White
     }
     "watch"            {
-      if ($e.first) { Write-Host "$time  Watch $($e.address) = $($e.value)" -ForegroundColor Green }
-      else { Write-Host "$time  Watch $($e.address): $($e.previous) -> $($e.value)" -ForegroundColor Green }
+      if ($e.first) { Write-Host "$time  Watch $($e.watch) = $($e.value)   (at $($e.address))" -ForegroundColor Green }
+      else { Write-Host "$time  Watch $($e.watch): $($e.previous) -> $($e.value)" -ForegroundColor Green }
     }
-    "watch_added"      { Write-Host "$time  Now watching $($e.address)" -ForegroundColor Green }
+    "watch_noisy"      { Write-Host "$time  Watch $($e.watch) is changing constantly (muted for a second)" -ForegroundColor DarkGreen }
+    "watch_added"      { Write-Host "$time  Now watching $($e.watch)" -ForegroundColor Green }
+    "scan_pointers"    { Write-Host "            pointer paths from the game's globals: $($e.count)" -ForegroundColor White }
+    "scan_pointer"     { Write-Host "            $($e.candidate)  <-  $($e.path)" -ForegroundColor White }
     "scan_error"       { Write-Host "$time  Scan error: $($e.reason)" -ForegroundColor Red }
     default            { Write-Host "$time  $line" -ForegroundColor DarkGray }
   }
