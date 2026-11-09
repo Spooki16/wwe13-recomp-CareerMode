@@ -1,8 +1,8 @@
 // wwe13 career mode - bridge between the game and the career companion app. See career_bridge.h.
 //
 // Log format (one line per event, grep for "[career]"):
-//   [career] seq=N event=cinematic_start caller=0xXXXXXXXX [after_gameplay=SECONDS]
-//   [career] seq=N event=cinematic_end   caller=0xXXXXXXXX cinematic=SECONDS
+//   [career] seq=N event=cinematic_start callers=0xAAAAAAAA>0xBBBBBBBB>... [after_gameplay=SECONDS]
+//   [career] seq=N event=cinematic_end   callers=0xAAAAAAAA>0xBBBBBBBB>... cinematic=SECONDS
 //   [career] seq=N event=gameplay_segment duration=SECONDS [likely_match]
 //
 // A gameplay segment is the time between returning to 60 FPS and the next cinematic. In the first test show the
@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <string>
 
 #include <rex/logging.h>
 
@@ -42,13 +43,28 @@ State& GetState() {
   return state;
 }
 
+// "0x822EF57C>0x82123456>..." innermost first, stopping at the first empty entry.
+std::string FormatCallers(const CallerChain& callers) {
+  std::string text;
+  for (uint32_t address : callers) {
+    if (address == 0) {
+      break;
+    }
+    if (!text.empty()) {
+      text += '>';
+    }
+    text += fmt::format("0x{:08X}", address);
+  }
+  return text.empty() ? "unknown" : text;
+}
+
 double SecondsBetween(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
   return std::chrono::duration<double>(to - from).count();
 }
 
 }  // namespace
 
-void OnCinematicStart(uint32_t return_address) {
+void OnCinematicStart(const CallerChain& callers) {
   State& state = GetState();
   const auto now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -57,17 +73,17 @@ void OnCinematicStart(uint32_t return_address) {
     const double gameplay = SecondsBetween(state.gameplay_start, now);
     REXLOG_INFO("[career] seq={} event=gameplay_segment duration={:.1f}{}", ++state.seq, gameplay,
                 gameplay >= kLikelyMatchSeconds ? " likely_match" : "");
-    REXLOG_INFO("[career] seq={} event=cinematic_start caller=0x{:08X} after_gameplay={:.1f}", ++state.seq,
-                return_address, gameplay);
+    REXLOG_INFO("[career] seq={} event=cinematic_start callers={} after_gameplay={:.1f}", ++state.seq,
+                FormatCallers(callers), gameplay);
   } else {
-    REXLOG_INFO("[career] seq={} event=cinematic_start caller=0x{:08X}", ++state.seq, return_address);
+    REXLOG_INFO("[career] seq={} event=cinematic_start callers={}", ++state.seq, FormatCallers(callers));
   }
 
   state.phase = Phase::Cinematic;
   state.cinematic_start = now;
 }
 
-void OnCinematicEnd(uint32_t return_address) {
+void OnCinematicEnd(const CallerChain& callers) {
   State& state = GetState();
   const auto now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -78,10 +94,10 @@ void OnCinematicEnd(uint32_t return_address) {
   }
 
   if (state.phase == Phase::Cinematic) {
-    REXLOG_INFO("[career] seq={} event=cinematic_end caller=0x{:08X} cinematic={:.1f}", ++state.seq,
-                return_address, SecondsBetween(state.cinematic_start, now));
+    REXLOG_INFO("[career] seq={} event=cinematic_end callers={} cinematic={:.1f}", ++state.seq,
+                FormatCallers(callers), SecondsBetween(state.cinematic_start, now));
   } else {
-    REXLOG_INFO("[career] seq={} event=cinematic_end caller=0x{:08X}", ++state.seq, return_address);
+    REXLOG_INFO("[career] seq={} event=cinematic_end callers={}", ++state.seq, FormatCallers(callers));
   }
 
   state.phase = Phase::Gameplay;

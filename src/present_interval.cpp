@@ -79,9 +79,39 @@ bool Keep60() {
 }
 }  // namespace
 
+// Career bridge: the guest call chain that led here, innermost first. [0] is ctx.lr. The outer entries follow the
+// Xbox 360 stack back chain: [r1] holds the caller's caller's stack pointer, and every non-leaf prologue saves its
+// return address 8 bytes below that (mflr r12; stw r12,-8(r1)). The walk stops at anything that does not look like a
+// stack frame or a code address, so a leaf function or a broken chain just shortens the list.
+namespace {
+wwe13::career::CallerChain GuestCallers(PPCContext& ctx, uint8_t* base) {
+  constexpr uint32_t kCodeLow = 0x82000000, kCodeHigh = 0x84000000;
+  constexpr uint32_t kMaxFrameBytes = 0x10000;
+  wwe13::career::CallerChain chain{};
+  chain[0] = uint32_t(ctx.lr);
+  uint32_t sp = ctx.r1.u32;
+  for (size_t i = 1; i < chain.size(); ++i) {
+    if (sp == 0 || (sp & 3) != 0) {
+      break;
+    }
+    const uint32_t next = PPC_LOAD_U32(sp);
+    if (next <= sp || next - sp > kMaxFrameBytes) {
+      break;
+    }
+    const uint32_t ret = PPC_LOAD_U32(next - 8);
+    if (ret < kCodeLow || ret >= kCodeHigh) {
+      break;
+    }
+    chain[i] = ret;
+    sp = next;
+  }
+  return chain;
+}
+}  // namespace
+
 extern "C" PPC_FUNC(__imp__sub_82AA65B0);
 extern "C" PPC_FUNC(sub_82AA65B0) {
-  wwe13::career::OnCinematicStart(uint32_t(ctx.lr));
+  wwe13::career::OnCinematicStart(GuestCallers(ctx, base));
   const uint32_t rate = PPC_LOAD_U32(0x835B2DF0);
   if (Lock30Requested()) {
     REXLOG_INFO("[wwe13-rate] halve request at rate {} ({})", rate,
@@ -107,7 +137,7 @@ extern "C" PPC_FUNC(sub_82AA65B0) {
 // timed in both modes: [wwe13-rate] halve ... = phase start, restore ... = phase end.
 extern "C" PPC_FUNC(__imp__sub_82AA6650);
 extern "C" PPC_FUNC(sub_82AA6650) {
-  wwe13::career::OnCinematicEnd(uint32_t(ctx.lr));
+  wwe13::career::OnCinematicEnd(GuestCallers(ctx, base));
   const uint32_t rate = PPC_LOAD_U32(0x835B2DF0);
   if (Lock30Active()) {
     REXLOG_INFO("[wwe13-rate] restore request at rate {} (suppressed; locked at 30)", rate);

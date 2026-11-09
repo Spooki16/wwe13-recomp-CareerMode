@@ -9,15 +9,20 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace wwe13::career {
 
-// The game asked for a cinematic (30 FPS) phase. `return_address` is the guest return address (ctx.lr), which
-// identifies the game code that asked; different callers should separate entrances from post-match scenes.
-void OnCinematicStart(uint32_t return_address);
+// Guest return addresses, innermost first: [0] is ctx.lr (the direct caller), [1..] walk up the guest stack's back
+// chain. Unused entries are 0. Test show 1 found the direct caller is the same for every cinematic (0x822EF57C to
+// start, 0x822ED7C8 to end), so the outer callers are what should separate entrances from post-match scenes.
+using CallerChain = std::array<uint32_t, 6>;
+
+// The game asked for a cinematic (30 FPS) phase.
+void OnCinematicStart(const CallerChain& callers);
 
 // The game asked to return to gameplay (60 FPS). The game sends this twice in a row; the repeat is ignored.
-void OnCinematicEnd(uint32_t return_address);
+void OnCinematicEnd(const CallerChain& callers);
 
 }  // namespace wwe13::career
