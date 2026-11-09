@@ -1,0 +1,315 @@
+// wwe13 career mode - research memory scanner. See career_scanner.h.
+//
+// Scanned memory: every committed, writable region of guest virtual memory below the stacks (0x00000000-0x6FFFFFFF),
+// the XEX image heaps (0x80000000-0x9FFFFFFF), and one view of physical memory (0xA0000000-0xBFFFFFFF; 0xC0000000
+// and 0xE0000000 are other views of the same physical pages). Thread stacks and the GPU/MMIO range are skipped.
+//
+// Method, per 32-bit aligned word:
+//   - the first mark of a state stores a full snapshot as that state's reference;
+//   - every later mark of the same state kills words whose value moved since the reference;
+//   - once both states have references, words equal in both are killed too.
+// When the survivors drop below kListThreshold, the snapshots are replaced by a short candidate list (address,
+// value in A, value in B), which later marks keep filtering. Memory use peaks at two snapshots (a few hundred MB).
+
+#include "career_scanner.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <rex/logging.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
+
+#include "career_bridge.h"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+namespace wwe13::career {
+namespace {
+
+constexpr size_t kListThreshold = 200000;  // survivors below this switch to a candidate list
+constexpr size_t kReportMax = 40;          // candidates written out by F9 or when the list gets this short
+
+struct Range {
+  uint32_t low;
+  uint32_t high;  // exclusive
+};
+constexpr Range kScanRanges[] = {
+    {0x00000000u, 0x70000000u},
+    {0x80000000u, 0xA0000000u},
+    {0xA0000000u, 0xC0000000u},
+};
+
+struct Region {
+  uint32_t base = 0;
+  uint32_t size = 0;                  // bytes, multiple of 4
+  std::vector<uint32_t> ref[2];       // reference snapshot per state (host order of the raw bytes)
+  std::vector<uint64_t> alive;        // one bit per word
+};
+
+struct Candidate {
+  uint32_t address;
+  uint32_t value[2];  // raw word in state A and state B, as stored in guest memory (big-endian)
+};
+
+struct Scan {
+  std::vector<Region> regions;          // snapshot mode
+  std::vector<Candidate> candidates;    // list mode
+  bool list_mode = false;
+  bool has_ref[2] = {false, false};
+  int marks[2] = {0, 0};
+};
+
+Scan g_scan;
+std::mutex g_scan_mutex;
+
+uint32_t SwapBe(uint32_t raw) {
+  return ((raw & 0xFF) << 24) | ((raw & 0xFF00) << 8) | ((raw >> 8) & 0xFF00) | (raw >> 24);
+}
+
+// Copies guest memory; returns false instead of crashing if a page faults (e.g. freed during the copy).
+bool SafeCopy(void* destination, const void* source, size_t bytes) {
+#ifdef _WIN32
+  __try {
+    std::memcpy(destination, source, bytes);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+#else
+  std::memcpy(destination, source, bytes);
+  return true;
+#endif
+}
+
+rex::memory::Memory* GuestMemory() {
+  rex::system::KernelState* const kernel_state = REX_KERNEL_STATE();
+  return kernel_state ? kernel_state->memory() : nullptr;
+}
+
+// Committed, readable and writable regions inside the scan ranges.
+std::vector<Region> FindRegions(rex::memory::Memory* memory) {
+  std::vector<Region> regions;
+  for (const Range& range : kScanRanges) {
+    uint64_t address = range.low;
+    while (address < range.high) {
+      rex::memory::BaseHeap* const heap = memory->LookupHeap(static_cast<uint32_t>(address));
+      if (!heap) {
+        address += 0x10000;
+        continue;
+      }
+      const uint64_t heap_end = uint64_t(heap->heap_base()) + heap->heap_size();
+      rex::memory::HeapAllocationInfo info{};
+      if (!heap->QueryRegionInfo(static_cast<uint32_t>(address), &info) || info.region_size == 0) {
+        address += 0x1000;
+        continue;
+      }
+      const uint64_t start = std::max<uint64_t>(info.base_address, address);
+      const uint64_t end = std::min<uint64_t>({uint64_t(info.base_address) + info.region_size, heap_end, range.high});
+      const bool usable = (info.state & rex::memory::kMemoryAllocationCommit) &&
+                          (info.protect & rex::memory::kMemoryProtectRead) &&
+                          (info.protect & rex::memory::kMemoryProtectWrite);
+      if (usable && end > start) {
+        Region region;
+        region.base = static_cast<uint32_t>(start);
+        region.size = static_cast<uint32_t>((end - start) & ~uint64_t(3));
+        if (region.size > 0) {
+          regions.push_back(std::move(region));
+        }
+      }
+      address = std::max<uint64_t>(end, address + 0x1000);
+    }
+  }
+  return regions;
+}
+
+size_t CountAlive(const Scan& scan) {
+  if (scan.list_mode) {
+    return scan.candidates.size();
+  }
+  size_t alive = 0;
+  for (const Region& region : scan.regions) {
+    for (uint64_t bits : region.alive) {
+      alive += static_cast<size_t>(__builtin_popcountll(bits));
+    }
+  }
+  return alive;
+}
+
+void Report(const Scan& scan, size_t limit) {
+  const size_t shown = std::min(limit, scan.candidates.size());
+  for (size_t i = 0; i < shown; ++i) {
+    const Candidate& c = scan.candidates[i];
+    Emit("scan_candidate", fmt::format(R"("address":"0x{:08X}","a":"0x{:08X}","b":"0x{:08X}")", c.address,
+                                       SwapBe(c.value[0]), SwapBe(c.value[1])));
+  }
+}
+
+// Turns the surviving words into a candidate list and frees the snapshots.
+void SwitchToList(Scan& scan) {
+  for (const Region& region : scan.regions) {
+    const size_t words = region.size / 4;
+    for (size_t w = 0; w < words; ++w) {
+      if (region.alive[w / 64] & (uint64_t(1) << (w % 64))) {
+        scan.candidates.push_back({region.base + static_cast<uint32_t>(w * 4), {region.ref[0][w], region.ref[1][w]}});
+      }
+    }
+  }
+  scan.regions.clear();
+  scan.regions.shrink_to_fit();
+  scan.list_mode = true;
+}
+
+[[maybe_unused]] void Mark(int state) {
+  rex::memory::Memory* const memory = GuestMemory();
+  if (!memory) {
+    Emit("scan_error", R"("reason":"game memory not ready")");
+    return;
+  }
+  const auto started = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(g_scan_mutex);
+  Scan& scan = g_scan;
+  const int other = 1 - state;
+
+  if (scan.list_mode) {
+    // Filter the short list: the word must still hold this state's value.
+    std::vector<Candidate> kept;
+    for (const Candidate& c : scan.candidates) {
+      uint32_t raw = 0;
+      if (SafeCopy(&raw, memory->TranslateVirtual<const uint8_t*>(c.address), 4) && raw == c.value[state]) {
+        kept.push_back(c);
+      }
+    }
+    scan.candidates.swap(kept);
+  } else {
+    if (scan.regions.empty()) {
+      scan.regions = FindRegions(memory);
+      for (Region& region : scan.regions) {
+        region.alive.assign((region.size / 4 + 63) / 64, ~uint64_t(0));
+        const size_t words = region.size / 4;
+        if (words % 64) {
+          region.alive.back() = (uint64_t(1) << (words % 64)) - 1;
+        }
+      }
+    }
+    const bool first_of_state = !scan.has_ref[state];
+    for (Region& region : scan.regions) {
+      const size_t words = region.size / 4;
+      if (!first_of_state && region.ref[state].empty()) {
+        continue;  // this region was dropped earlier
+      }
+      std::vector<uint32_t> now(words);
+      if (!SafeCopy(now.data(), memory->TranslateVirtual<const uint8_t*>(region.base), region.size)) {
+        std::fill(region.alive.begin(), region.alive.end(), 0);  // region went away: nothing in it can be trusted
+        region.ref[0].clear();
+        region.ref[1].clear();
+        continue;
+      }
+      if (first_of_state) {
+        region.ref[state] = std::move(now);
+        // With both references in hand, a word that is the same in A and B doesn't track the state.
+        const std::vector<uint32_t>& theirs = region.ref[other];
+        if (!theirs.empty()) {
+          for (size_t w = 0; w < words; ++w) {
+            if (region.ref[state][w] == theirs[w]) {
+              region.alive[w / 64] &= ~(uint64_t(1) << (w % 64));
+            }
+          }
+        }
+      } else {
+        // The word must hold the same value every time this state is marked.
+        for (size_t w = 0; w < words; ++w) {
+          if (now[w] != region.ref[state][w]) {
+            region.alive[w / 64] &= ~(uint64_t(1) << (w % 64));
+          }
+        }
+      }
+    }
+    scan.has_ref[state] = true;
+    if (scan.has_ref[0] && scan.has_ref[1] && CountAlive(scan) < kListThreshold) {
+      SwitchToList(scan);
+    }
+  }
+
+  ++scan.marks[state];
+  const size_t alive = CountAlive(scan);
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  Emit("scan_mark", fmt::format(R"("state":"{}","marks_a":{},"marks_b":{},"candidates":{},"scan_seconds":{:.2f})",
+                                state == 0 ? "A" : "B", scan.marks[0], scan.marks[1], alive, seconds));
+  if (scan.list_mode && alive <= kReportMax) {
+    Report(scan, kReportMax);
+  }
+}
+
+[[maybe_unused]] void Reset() {
+  std::lock_guard<std::mutex> lock(g_scan_mutex);
+  g_scan = Scan{};
+  Emit("scan_reset");
+}
+
+[[maybe_unused]] void ListCandidates() {
+  std::lock_guard<std::mutex> lock(g_scan_mutex);
+  if (!g_scan.list_mode) {
+    Emit("scan_list", fmt::format(R"("candidates":{},"note":"still too many to list; keep marking")",
+                                  CountAlive(g_scan)));
+    return;
+  }
+  Emit("scan_list", fmt::format(R"("candidates":{})", g_scan.candidates.size()));
+  Report(g_scan, kReportMax);
+}
+
+#ifdef _WIN32
+bool GameWindowFocused() {
+  HWND window = GetForegroundWindow();
+  DWORD process = 0;
+  GetWindowThreadProcessId(window, &process);
+  return window && process == GetCurrentProcessId();
+}
+
+void BackgroundThread() {
+  bool was_down[4] = {false, false, false, false};
+  const int keys[4] = {VK_F6, VK_F7, VK_F8, VK_F9};
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Tick();
+    const bool focused = GameWindowFocused();
+    for (int i = 0; i < 4; ++i) {
+      const bool down = focused && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
+      if (down && !was_down[i]) {
+        switch (keys[i]) {
+          case VK_F6: Reset(); break;
+          case VK_F7: Mark(0); break;
+          case VK_F8: Mark(1); break;
+          case VK_F9: ListCandidates(); break;
+        }
+      }
+      was_down[i] = down;
+    }
+  }
+}
+#endif
+
+[[maybe_unused]] std::once_flag g_started;
+
+}  // namespace
+
+void StartScanner() {
+#ifdef _WIN32
+  std::call_once(g_started, [] { std::thread(BackgroundThread).detach(); });
+#endif
+}
+
+}  // namespace wwe13::career

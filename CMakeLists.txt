@@ -77,11 +77,13 @@ add_executable(wwe13
   src/scene_aa.cpp
   src/xmp_audio_probe.cpp
   src/shader_cache_seed.cpp
-  src/career_bridge.cpp)
+  src/career_bridge.cpp
+  src/career_pipe.cpp
+  src/career_scanner.cpp)
 target_include_directories(wwe13 PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 rexglue_setup_target(wwe13)
 if(WIN32)
-  target_link_libraries(wwe13 PRIVATE advapi32)
+  target_link_libraries(wwe13 PRIVATE advapi32 user32)  # user32: career scanner hotkeys
   # Link map next to the exe: symbol -> object resolution for Windows-only link checks.
   target_link_options(wwe13 PRIVATE "LINKER:/map:$<TARGET_FILE_DIR:wwe13>/wwe13.map")
 endif()

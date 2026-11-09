@@ -1,0 +1,22 @@
+// wwe13 career mode - research tool: finds game memory that tracks a state you can switch on and off.
+//
+// Works like a "changed / unchanged" memory search. You mark the game as being in state A or state B with hotkeys,
+// several times each; the scanner keeps the 32-bit words that hold one value every time you mark A and a different
+// value every time you mark B. A few rounds narrow millions of words down to the handful that track that state.
+// First target: the pause flag (A = playing, B = paused). The same tool will find the match clock, the winner, etc.
+//
+// Hotkeys (only while the game window is focused):
+//   F7  mark state A (e.g. playing)          F8  mark state B (e.g. paused)
+//   F9  list the current candidates          F6  start over
+//
+// Progress and results go to the game log ("[career]" lines, event=scan_*) and to the companion app.
+// The scanner reads guest memory only; it never writes it. Reads that fault are caught and skipped.
+
+#pragma once
+
+namespace wwe13::career {
+
+// Starts the background thread: hotkeys, scanning, and Tick() for the bridge. Safe to call more than once.
+void StartScanner();
+
+}  // namespace wwe13::career
