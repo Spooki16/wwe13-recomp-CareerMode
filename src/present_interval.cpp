@@ -83,19 +83,38 @@ bool Keep60() {
 // Xbox 360 stack back chain: [r1] holds the caller's caller's stack pointer, and every non-leaf prologue saves its
 // return address 8 bytes below that (mflr r12; stw r12,-8(r1)). The walk stops at anything that does not look like a
 // stack frame or a code address, so a leaf function or a broken chain just shortens the list.
+//
+// Every read is checked against the thread's own stack, taken from the guest KPCR that r13 points at (stack base =
+// high address at +0x70, stack end = low address at +0x74). The first version only bounded each frame's size, and
+// test show 3 crashed as the post-match cinematic started; a read outside the bounds now ends the walk instead.
+// If the bounds can't be trusted, only ctx.lr is logged.
 namespace {
 wwe13::career::CallerChain GuestCallers(PPCContext& ctx, uint8_t* base) {
   constexpr uint32_t kCodeLow = 0x82000000, kCodeHigh = 0x84000000;
   constexpr uint32_t kMaxFrameBytes = 0x10000;
+  constexpr uint32_t kMaxStackBytes = 0x01000000;
   wwe13::career::CallerChain chain{};
   chain[0] = uint32_t(ctx.lr);
+
+  const uint32_t pcr = ctx.r13.u32;
+  if (pcr == 0 || (pcr & 3) != 0) {
+    return chain;
+  }
+  const uint32_t stack_high = PPC_LOAD_U32(pcr + 0x70);
+  const uint32_t stack_low = PPC_LOAD_U32(pcr + 0x74);
+  if (stack_low == 0 || stack_high <= stack_low || stack_high - stack_low > kMaxStackBytes) {
+    return chain;
+  }
+  // A 4-byte read at `address` is safe only if it lies entirely inside this thread's stack.
+  const auto in_stack = [&](uint32_t address) { return address >= stack_low && address <= stack_high - 4; };
+
   uint32_t sp = ctx.r1.u32;
   for (size_t i = 1; i < chain.size(); ++i) {
-    if (sp == 0 || (sp & 3) != 0) {
+    if ((sp & 3) != 0 || !in_stack(sp)) {
       break;
     }
     const uint32_t next = PPC_LOAD_U32(sp);
-    if (next <= sp || next - sp > kMaxFrameBytes) {
+    if (next <= sp || next - sp > kMaxFrameBytes || !in_stack(next - 8)) {
       break;
     }
     const uint32_t ret = PPC_LOAD_U32(next - 8);
