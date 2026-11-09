@@ -19,6 +19,8 @@
 #include <rex/ppc/context.h>
 #include <rex/ppc/memory.h>
 
+#include "career_bridge.h"
+
 namespace {
 bool ForceInterval1() {
   static const bool enabled = [] {
@@ -79,6 +81,7 @@ bool Keep60() {
 
 extern "C" PPC_FUNC(__imp__sub_82AA65B0);
 extern "C" PPC_FUNC(sub_82AA65B0) {
+  wwe13::career::OnCinematicStart(uint32_t(ctx.lr));
   const uint32_t rate = PPC_LOAD_U32(0x835B2DF0);
   if (Lock30Requested()) {
     REXLOG_INFO("[wwe13-rate] halve request at rate {} ({})", rate,
@@ -104,6 +107,7 @@ extern "C" PPC_FUNC(sub_82AA65B0) {
 // timed in both modes: [wwe13-rate] halve ... = phase start, restore ... = phase end.
 extern "C" PPC_FUNC(__imp__sub_82AA6650);
 extern "C" PPC_FUNC(sub_82AA6650) {
+  wwe13::career::OnCinematicEnd(uint32_t(ctx.lr));
   const uint32_t rate = PPC_LOAD_U32(0x835B2DF0);
   if (Lock30Active()) {
     REXLOG_INFO("[wwe13-rate] restore request at rate {} (suppressed; locked at 30)", rate);

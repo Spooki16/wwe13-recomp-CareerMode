@@ -76,7 +76,8 @@ add_executable(wwe13
   src/text_entry_keyboard.cpp
   src/scene_aa.cpp
   src/xmp_audio_probe.cpp
-  src/shader_cache_seed.cpp)
+  src/shader_cache_seed.cpp
+  src/career_bridge.cpp)
 target_include_directories(wwe13 PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 rexglue_setup_target(wwe13)
 if(WIN32)
