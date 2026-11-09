@@ -8,6 +8,7 @@
 // Hotkeys (only while the game window is focused):
 //   F7  mark state A (e.g. playing)          F8  mark state B (e.g. paused)
 //   F9  list the current candidates          F6  start over
+//   F10 watch the best candidate live (every change is reported)
 //
 // Progress and results go to the game log ("[career]" lines, event=scan_*) and to the companion app.
 // The scanner reads guest memory only; it never writes it. Reads that fault are caught and skipped.

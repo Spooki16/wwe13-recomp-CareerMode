@@ -377,21 +377,78 @@ bool GameWindowFocused() {
   return window && process == GetCurrentProcessId();
 }
 
+// Live watches: addresses read every tick, with each change sent as a "watch" event. Used to confirm a scan result
+// (does it flip exactly when the state does, and nothing else?) and to check whether it keeps its address in a new
+// session. The default is the pause-flag candidate from the first successful pause scan.
+struct Watch {
+  uint32_t address;
+  uint32_t last = 0;
+  bool has_last = false;
+};
+std::vector<Watch> g_watches = {
+    {0xAE37D3A8u},  // pause scan 2026-11-10: 2 while playing, 0 while paused (14 A / 11 B marks)
+};
+constexpr size_t kMaxWatches = 8;
+
+void PollWatches() {
+  rex::memory::Memory* const memory = GuestMemory();
+  if (!memory) {
+    return;
+  }
+  for (Watch& watch : g_watches) {
+    uint32_t raw = 0;
+    if (!SafeCopy(&raw, memory->TranslateVirtual<const uint8_t*>(watch.address), 4)) {
+      continue;
+    }
+    const uint32_t value = SwapBe(raw);
+    if (!watch.has_last) {
+      Emit("watch", fmt::format(R"("address":"0x{:08X}","value":{},"first":true)", watch.address, value));
+    } else if (value != watch.last) {
+      Emit("watch", fmt::format(R"("address":"0x{:08X}","value":{},"previous":{})", watch.address, value,
+                                watch.last));
+    }
+    watch.last = value;
+    watch.has_last = true;
+  }
+}
+
+// F10: watch the best-ranked scan candidate.
+void WatchTopCandidate() {
+  std::lock_guard<std::mutex> lock(g_scan_mutex);
+  if (!g_scan.list_mode || g_scan.candidates.empty()) {
+    Emit("scan_error", R"("reason":"no candidate list to watch from yet")");
+    return;
+  }
+  const uint32_t address = Ranked(g_scan).front().address;
+  for (const Watch& watch : g_watches) {
+    if (watch.address == address) {
+      return;
+    }
+  }
+  if (g_watches.size() >= kMaxWatches) {
+    g_watches.erase(g_watches.begin());
+  }
+  g_watches.push_back({address});
+  Emit("watch_added", fmt::format(R"("address":"0x{:08X}")", address));
+}
+
 void BackgroundThread() {
-  bool was_down[4] = {false, false, false, false};
-  const int keys[4] = {VK_F6, VK_F7, VK_F8, VK_F9};
+  constexpr int kKeys[5] = {VK_F6, VK_F7, VK_F8, VK_F9, VK_F10};
+  bool was_down[5] = {false, false, false, false, false};
   for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     Tick();
+    PollWatches();
     const bool focused = GameWindowFocused();
-    for (int i = 0; i < 4; ++i) {
-      const bool down = focused && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
+    for (int i = 0; i < 5; ++i) {
+      const bool down = focused && (GetAsyncKeyState(kKeys[i]) & 0x8000) != 0;
       if (down && !was_down[i]) {
-        switch (keys[i]) {
+        switch (kKeys[i]) {
           case VK_F6: Reset(); break;
           case VK_F7: Mark(0); break;
           case VK_F8: Mark(1); break;
           case VK_F9: ListCandidates(); break;
+          case VK_F10: WatchTopCandidate(); break;
         }
       }
       was_down[i] = down;

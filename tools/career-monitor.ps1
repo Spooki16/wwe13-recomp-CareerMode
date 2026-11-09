@@ -46,6 +46,11 @@ function Show-Event($e, [string]$line) {
       $tag = if ($e.flag_like) { "flag-like" } else { "" }
       Write-Host ("            {0}   A={1}   B={2}   {3,-8} {4}" -f $e.address, $e.a, $e.b, $e.range, $tag) -ForegroundColor White
     }
+    "watch"            {
+      if ($e.first) { Write-Host "$time  Watch $($e.address) = $($e.value)" -ForegroundColor Green }
+      else { Write-Host "$time  Watch $($e.address): $($e.previous) -> $($e.value)" -ForegroundColor Green }
+    }
+    "watch_added"      { Write-Host "$time  Now watching $($e.address)" -ForegroundColor Green }
     "scan_error"       { Write-Host "$time  Scan error: $($e.reason)" -ForegroundColor Red }
     default            { Write-Host "$time  $line" -ForegroundColor DarkGray }
   }
