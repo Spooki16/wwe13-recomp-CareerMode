@@ -681,7 +681,9 @@ struct Watch {
   std::chrono::steady_clock::time_point second_start{};
   std::chrono::steady_clock::time_point muted_until{};
 };
-std::vector<Watch> g_watches;  // none by default: the first pause candidate moved in the next session
+// Watched from the start of every session. [0x833FB1E0]+0x1AF4: found by the first value scan (only ever went up,
+// in bursts during action, frozen while paused); what it measures is still being worked out.
+std::vector<Watch> g_watches = {Watch{0x833FB1E0u, {0x1AF4u}}};
 constexpr size_t kMaxWatches = 8;
 constexpr int kNoisyChanges = 5;
 
