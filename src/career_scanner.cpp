@@ -113,6 +113,26 @@ rex::memory::Memory* GuestMemory() {
   return kernel_state ? kernel_state->memory() : nullptr;
 }
 
+// True if the 4 bytes at `address` are committed, readable guest memory. Must be checked before reading an address
+// that came from game data (a pointer path): the emulator's own exception handler runs before SafeCopy's guard and
+// crashed the game when a junk pointer led into memory it handles specially (MMIO at 0x7F000000, unmapped pages).
+bool IsReadable(rex::memory::Memory* memory, uint32_t address) {
+  if (address < 0x10000u || (address >= 0x7F000000u && address < 0x80000000u) || (address & 3u)) {
+    return false;
+  }
+  rex::memory::BaseHeap* const heap = memory->LookupHeap(address);
+  if (!heap) {
+    return false;
+  }
+  rex::memory::HeapAllocationInfo info{};
+  if (!heap->QueryRegionInfo(address & ~0xFFFu, &info) || info.region_size == 0) {
+    return false;
+  }
+  const uint64_t end = uint64_t(info.base_address) + info.region_size;
+  return (info.state & rex::memory::kMemoryAllocationCommit) && (info.protect & rex::memory::kMemoryProtectRead) &&
+         uint64_t(address) + 4 <= end && address >= info.base_address;
+}
+
 // Committed, readable and writable regions inside the scan ranges.
 std::vector<Region> FindRegions(rex::memory::Memory* memory) {
   std::vector<Region> regions;
@@ -707,7 +727,7 @@ bool ResolveWatch(rex::memory::Memory* memory, const Watch& watch, uint32_t* add
   uint32_t current = watch.global;
   for (uint32_t offset : watch.offsets) {
     uint32_t raw = 0;
-    if (!SafeCopy(&raw, memory->TranslateVirtual<const uint8_t*>(current), 4)) {
+    if (!IsReadable(memory, current) || !SafeCopy(&raw, memory->TranslateVirtual<const uint8_t*>(current), 4)) {
       return false;
     }
     const uint32_t pointer = SwapBe(raw);
@@ -715,6 +735,9 @@ bool ResolveWatch(rex::memory::Memory* memory, const Watch& watch, uint32_t* add
       return false;
     }
     current = pointer + offset;
+  }
+  if (!IsReadable(memory, current)) {
+    return false;
   }
   *address = current;
   return true;
@@ -836,6 +859,9 @@ void BackgroundThread() {
 bool ReadGuestU32(uint32_t address, uint32_t* value) {
   rex::memory::Memory* const memory = GuestMemory();
   if (!memory) {
+    return false;
+  }
+  if (!IsReadable(memory, address)) {
     return false;
   }
   const uint8_t* const source = memory->TranslateVirtual<const uint8_t*>(address);
