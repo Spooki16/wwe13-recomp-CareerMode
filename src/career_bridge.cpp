@@ -63,7 +63,8 @@ struct State {
   // pause tracking: time paused since the current phase began, and the pause in progress (if any)
   bool paused = false;
   bool pause_known = false;
-  Clock::time_point pause_start{};
+  Clock::time_point pause_start{};   // start of the pause in progress, or of the phase if it began paused
+  Clock::time_point pause_began{};   // when the player actually pressed pause (for the pause_end duration)
   double phase_paused = 0.0;
   int phase_pauses = 0;
 };
@@ -128,7 +129,7 @@ void Emit(std::string_view event, std::string_view fields) {
   static std::mutex emit_mutex;
   static uint64_t seq = 0;
   std::call_once(g_hello, [] {
-    SendLine(R"({"seq":0,"t":0.0,"event":"bridge_start","version":"phase0-5"})");
+    SendLine(R"({"seq":0,"t":0.0,"event":"bridge_start","version":"phase0-6"})");
   });
   std::lock_guard<std::mutex> lock(emit_mutex);
   ++seq;
@@ -236,15 +237,18 @@ void Tick() {
       state.pause_known = true;
       state.paused = paused;
       state.pause_start = now;
+      state.pause_began = now;
     } else if (paused != state.paused) {
       state.paused = paused;
       if (paused) {
         state.pause_start = now;
+        state.pause_began = now;
         ++state.phase_pauses;
         Emit("pause_start", fmt::format(R"("phase":"{}")", PhaseName(state.phase)));
       } else {
-        const double duration = SecondsBetween(state.pause_start, now);
-        state.phase_paused += duration;
+        state.phase_paused += SecondsBetween(state.pause_start, now);
+        // The whole pause, even if a new phase began during it.
+        const double duration = SecondsBetween(state.pause_began, now);
         Emit("pause_end", fmt::format(R"("phase":"{}","duration":{:.1f})", PhaseName(state.phase), duration));
       }
     }
