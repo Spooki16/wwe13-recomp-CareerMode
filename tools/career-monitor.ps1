@@ -48,12 +48,24 @@ function Show-Event($e, [string]$line) {
       }
     }
     "scan_candidate"   {
-      $tag = if ($e.flag_like) { "flag-like" } else { "" }
-      Write-Host ("            {0}   A={1}   B={2}   {3,-8} {4}" -f $e.address, $e.a, $e.b, $e.range, $tag) -ForegroundColor White
+      if ($e.value_mode) {
+        $f = if ($e.now_float) { "  (as decimal: $($e.now_float))" } else { "" }
+        Write-Host ("            {0}   now {1}{2}   {3}" -f $e.address, $e.now, $f, $e.range) -ForegroundColor White
+      } else {
+        $tag = if ($e.flag_like) { "flag-like" } else { "" }
+        Write-Host ("            {0}   A={1}   B={2}   {3,-8} {4}" -f $e.address, $e.a, $e.b, $e.range, $tag) -ForegroundColor White
+      }
+    }
+    "scan_check"       {
+      $what = @{ start = "started (every value remembered)"; up = "went up"; down = "went down"; same = "unchanged"; changed = "changed" }[$e.check]
+      $secs = if ($e.scan_seconds) { "  [$($e.scan_seconds) s]" } else { "" }
+      Write-Host "$time  Value scan: $what  - candidates: $($e.candidates)$secs" -ForegroundColor White
     }
     "watch"            {
-      if ($e.first) { Write-Host "$time  Watch $($e.watch) = $($e.value)   (at $($e.address))" -ForegroundColor Green }
-      else { Write-Host "$time  Watch $($e.watch): $($e.previous) -> $($e.value)" -ForegroundColor Green }
+      $now = if ($e.float) { "$($e.value) (decimal $($e.float))" } else { "$($e.value)" }
+      $was = if ($e.previous_float) { "$($e.previous) (decimal $($e.previous_float))" } else { "$($e.previous)" }
+      if ($e.first) { Write-Host "$time  Watch $($e.watch) = $now   (at $($e.address))" -ForegroundColor Green }
+      else { Write-Host "$time  Watch $($e.watch): $was -> $now" -ForegroundColor Green }
     }
     "watch_noisy"      { Write-Host "$time  Watch $($e.watch) is changing constantly (muted for a second)" -ForegroundColor DarkGreen }
     "watch_added"      { Write-Host "$time  Now watching $($e.watch)" -ForegroundColor Green }

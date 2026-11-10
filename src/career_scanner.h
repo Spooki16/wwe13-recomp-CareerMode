@@ -10,6 +10,11 @@
 //   F9  list the current candidates          F6  start over
 //   F10 watch the best candidate live (every change is reported)
 //
+// Value scan, for numbers rather than on/off states (a clock, a health bar, a meter, a counter):
+//   Ctrl+F6  start (remembers every value)    Ctrl+F7  went up since the last check
+//   Ctrl+F8  went down                        Ctrl+F9  didn't change          Ctrl+F10  changed
+//   F9 and F10 then list and watch the survivors as usual; F6 starts over.
+//
 // Progress and results go to the game log ("[career]" lines, event=scan_*) and to the companion app.
 // The scanner reads guest memory only; it never writes it. Reads that fault are caught and skipped.
 

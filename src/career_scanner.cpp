@@ -73,6 +73,11 @@ struct Scan {
   std::vector<Region> regions;          // snapshot mode
   std::vector<Candidate> candidates;    // list mode
   bool list_mode = false;
+  // Value scan (Ctrl+F6..F10): finds a number by how it moves (up, down, unchanged, changed) instead of two states.
+  // Snapshot mode keeps the previous read in ref[0]; list mode keeps the value at the switch in value[0] and the
+  // latest read in value[1].
+  bool value_mode = false;
+  int checks = 0;
   bool has_ref[2] = {false, false};
   int marks[2] = {0, 0};
 };
@@ -200,14 +205,26 @@ std::vector<Candidate> Ranked(const Scan& scan) {
   return ranked;
 }
 
+// The value read as a float, when it looks like one (a normal number between 0.001 and a billion), else "".
+std::string FloatText(uint32_t bits) {
+  float f = 0.0f;
+  std::memcpy(&f, &bits, 4);
+  const float magnitude = f < 0 ? -f : f;
+  if (bits == 0 || !(magnitude >= 0.001f && magnitude <= 1e9f)) {
+    return {};
+  }
+  return fmt::format("{:.4g}", f);
+}
+
 void Report(const Scan& scan, size_t limit) {
   const std::vector<Candidate> ranked = Ranked(scan);
   const size_t shown = std::min(limit, ranked.size());
   for (size_t i = 0; i < shown; ++i) {
     const Candidate& c = ranked[i];
-    Emit("scan_candidate", fmt::format(R"("address":"0x{:08X}","a":"0x{:08X}","b":"0x{:08X}","range":"{}","flag_like":{})",
+    Emit("scan_candidate", fmt::format(R"("address":"0x{:08X}","a":"0x{:08X}","b":"0x{:08X}","range":"{}","flag_like":{},"value_mode":{},"now":{},"now_float":"{}")",
                                        c.address, SwapBe(c.value[0]), SwapBe(c.value[1]), RangeName(c.address),
-                                       FlagLike(c) ? "true" : "false"));
+                                       FlagLike(c) ? "true" : "false", scan.value_mode ? "true" : "false",
+                                       static_cast<int32_t>(SwapBe(c.value[1])), FloatText(SwapBe(c.value[1]))));
   }
 }
 
@@ -250,6 +267,10 @@ void SwitchToList(Scan& scan) {
   std::lock_guard<std::mutex> lock(g_scan_mutex);
   Scan& scan = g_scan;
   const int other = 1 - state;
+  if (scan.value_mode) {
+    Emit("scan_error", R"("reason":"a value scan is running (Ctrl keys); press F6 to start over before marking A/B")");
+    return;
+  }
 
   if (scan.list_mode) {
     // Filter the short list: the word must still hold this state's value.
@@ -316,6 +337,120 @@ void SwitchToList(Scan& scan) {
   const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
   Emit("scan_mark", fmt::format(R"("state":"{}","marks_a":{},"marks_b":{},"candidates":{},"scan_seconds":{:.2f})",
                                 state == 0 ? "A" : "B", scan.marks[0], scan.marks[1], alive, seconds));
+  if (scan.list_mode && alive <= kReportMax) {
+    Report(scan, kReportMax);
+  }
+}
+
+// ---- Value scan ------------------------------------------------------------------------------------------------
+// Words are compared as signed 32-bit integers. Positive floats (health, meters) order the same way as their bits, so
+// "went up" and "went down" work for them too.
+enum class Check { Start, Up, Down, Same, Changed };
+
+const char* CheckName(Check check) {
+  switch (check) {
+    case Check::Start: return "start";
+    case Check::Up: return "up";
+    case Check::Down: return "down";
+    case Check::Same: return "same";
+    case Check::Changed: return "changed";
+  }
+  return "?";
+}
+
+bool Passes(Check check, uint32_t before_raw, uint32_t now_raw) {
+  const int32_t before = static_cast<int32_t>(SwapBe(before_raw));
+  const int32_t now = static_cast<int32_t>(SwapBe(now_raw));
+  switch (check) {
+    case Check::Up: return now > before;
+    case Check::Down: return now < before;
+    case Check::Same: return now == before;
+    case Check::Changed: return now != before;
+    case Check::Start: return true;
+  }
+  return false;
+}
+
+[[maybe_unused]] void ValueCheck(Check check) {
+  rex::memory::Memory* const memory = GuestMemory();
+  if (!memory) {
+    Emit("scan_error", R"("reason":"game memory not ready")");
+    return;
+  }
+  const auto started = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(g_scan_mutex);
+  Scan& scan = g_scan;
+  const bool fresh = !scan.value_mode || check == Check::Start || (scan.regions.empty() && !scan.list_mode);
+  if (fresh) {
+    // Start over: snapshot everything; the next check compares against this.
+    scan = Scan{};
+    scan.value_mode = true;
+    scan.regions = FindRegions(memory);
+    for (Region& region : scan.regions) {
+      const size_t words = region.size / 4;
+      region.alive.assign((words + 63) / 64, ~uint64_t(0));
+      if (words % 64) {
+        region.alive.back() = (uint64_t(1) << (words % 64)) - 1;
+      }
+      region.ref[0].resize(words);
+      if (!SafeCopy(region.ref[0].data(), memory->TranslateVirtual<const uint8_t*>(region.base), region.size)) {
+        std::fill(region.alive.begin(), region.alive.end(), 0);
+        region.ref[0].clear();
+      }
+    }
+    Emit("scan_check", fmt::format(R"("check":"start","checks":0,"candidates":{})", CountAlive(scan)));
+    return;
+  }
+
+  if (scan.list_mode) {
+    std::vector<Candidate> kept;
+    for (Candidate c : scan.candidates) {
+      uint32_t raw = 0;
+      if (SafeCopy(&raw, memory->TranslateVirtual<const uint8_t*>(c.address), 4) && Passes(check, c.value[1], raw)) {
+        c.value[1] = raw;
+        kept.push_back(c);
+      }
+    }
+    scan.candidates.swap(kept);
+  } else {
+    for (Region& region : scan.regions) {
+      if (region.ref[0].empty()) {
+        continue;
+      }
+      const size_t words = region.size / 4;
+      std::vector<uint32_t> now(words);
+      if (!SafeCopy(now.data(), memory->TranslateVirtual<const uint8_t*>(region.base), region.size)) {
+        std::fill(region.alive.begin(), region.alive.end(), 0);
+        region.ref[0].clear();
+        continue;
+      }
+      for (size_t w = 0; w < words; ++w) {
+        if ((region.alive[w / 64] & (uint64_t(1) << (w % 64))) && !Passes(check, region.ref[0][w], now[w])) {
+          region.alive[w / 64] &= ~(uint64_t(1) << (w % 64));
+        }
+      }
+      region.ref[0] = std::move(now);
+    }
+    if (CountAlive(scan) < kListThreshold) {
+      for (const Region& region : scan.regions) {
+        const size_t words = region.ref[0].size();
+        for (size_t w = 0; w < words; ++w) {
+          if (region.alive[w / 64] & (uint64_t(1) << (w % 64))) {
+            scan.candidates.push_back({region.base + static_cast<uint32_t>(w * 4), {region.ref[0][w], region.ref[0][w]}});
+          }
+        }
+      }
+      scan.regions.clear();
+      scan.regions.shrink_to_fit();
+      scan.list_mode = true;
+    }
+  }
+
+  ++scan.checks;
+  const size_t alive = CountAlive(scan);
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  Emit("scan_check", fmt::format(R"("check":"{}","checks":{},"candidates":{},"scan_seconds":{:.2f})", CheckName(check),
+                                 scan.checks, alive, seconds));
   if (scan.list_mode && alive <= kReportMax) {
     Report(scan, kReportMax);
   }
@@ -466,9 +601,15 @@ std::string DumpCandidates(const Scan& scan, const std::vector<PointerPath>& pat
   if (!out) {
     return {};
   }
-  out << "# WWE 13 career scan: words with one value in every A mark and another in every B mark\n";
-  out << "# marks_a=" << scan.marks[0] << " marks_b=" << scan.marks[1] << " candidates=" << scan.candidates.size()
-      << "\n# address a b range flag_like (values as the game reads them)\n";
+  if (scan.value_mode) {
+    out << "# WWE 13 career value scan: words that moved the way every check said\n";
+    out << "# checks=" << scan.checks << " candidates=" << scan.candidates.size()
+        << "\n# address value_at_list_start value_now range flag_like (values as the game reads them)\n";
+  } else {
+    out << "# WWE 13 career scan: words with one value in every A mark and another in every B mark\n";
+    out << "# marks_a=" << scan.marks[0] << " marks_b=" << scan.marks[1] << " candidates=" << scan.candidates.size()
+        << "\n# address a b range flag_like (values as the game reads them)\n";
+  }
   for (const Candidate& c : Ranked(scan)) {
     out << fmt::format("0x{:08X} 0x{:08X} 0x{:08X} {} {}\n", c.address, SwapBe(c.value[0]), SwapBe(c.value[1]),
                        RangeName(c.address), FlagLike(c) ? 1 : 0);
@@ -604,11 +745,12 @@ void PollWatches() {
       continue;
     }
     if (!watch.has_last) {
-      Emit("watch", fmt::format(R"("watch":"{}","address":"0x{:08X}","value":{},"first":true)", WatchName(watch),
-                                address, value));
+      Emit("watch", fmt::format(R"("watch":"{}","address":"0x{:08X}","value":{},"first":true,"float":"{}")",
+                                WatchName(watch), address, static_cast<int32_t>(value), FloatText(value)));
     } else {
-      Emit("watch", fmt::format(R"("watch":"{}","address":"0x{:08X}","value":{},"previous":{})", WatchName(watch),
-                                address, value, previous));
+      Emit("watch", fmt::format(R"("watch":"{}","address":"0x{:08X}","value":{},"previous":{},"float":"{}","previous_float":"{}")",
+                                WatchName(watch), address, static_cast<int32_t>(value), static_cast<int32_t>(previous),
+                                FloatText(value), FloatText(previous)));
     }
     watch.has_last = true;
   }
@@ -649,15 +791,27 @@ void BackgroundThread() {
     Tick();
     PollWatches();
     const bool focused = GameWindowFocused();
+    const bool ctrl = focused && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     for (int i = 0; i < 5; ++i) {
       const bool down = focused && (GetAsyncKeyState(kKeys[i]) & 0x8000) != 0;
       if (down && !was_down[i]) {
-        switch (kKeys[i]) {
-          case VK_F6: Reset(); break;
-          case VK_F7: Mark(0); break;
-          case VK_F8: Mark(1); break;
-          case VK_F9: ListCandidates(); break;
-          case VK_F10: WatchTopCandidate(); break;
+        if (ctrl) {
+          // Value scan: Ctrl+F6 start, Ctrl+F7 went up, Ctrl+F8 went down, Ctrl+F9 unchanged, Ctrl+F10 changed.
+          switch (kKeys[i]) {
+            case VK_F6: ValueCheck(Check::Start); break;
+            case VK_F7: ValueCheck(Check::Up); break;
+            case VK_F8: ValueCheck(Check::Down); break;
+            case VK_F9: ValueCheck(Check::Same); break;
+            case VK_F10: ValueCheck(Check::Changed); break;
+          }
+        } else {
+          switch (kKeys[i]) {
+            case VK_F6: Reset(); break;
+            case VK_F7: Mark(0); break;
+            case VK_F8: Mark(1); break;
+            case VK_F9: ListCandidates(); break;
+            case VK_F10: WatchTopCandidate(); break;
+          }
         }
       }
       was_down[i] = down;
