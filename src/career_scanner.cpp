@@ -681,9 +681,15 @@ struct Watch {
   std::chrono::steady_clock::time_point second_start{};
   std::chrono::steady_clock::time_point muted_until{};
 };
-// Watched from the start of every session. [0x833FB1E0]+0x1AF4: found by the first value scan (only ever went up,
-// in bursts during action, frozen while paused); what it measures is still being worked out.
-std::vector<Watch> g_watches = {Watch{0x833FB1E0u, {0x1AF4u}}};
+// Watched from the start of every session. [0x833FB1E0]+0x1AF4 was found by the first value scan: it only rises,
+// on impacts (a strike landing on you, hitting the mat), and freezes while paused. Its object's constructor
+// (sub_827FC5E0) starts it at 100 inside a table of six RGBA colours at +6864 (red, white, grey 100, white, red,
+// grey 86), so it may be a damage-indicator colour. The neighbouring channels are watched too, to see which move
+// together: +0x1AF0/+0x1AF4/+0x1AF8 are the R/G/B of the grey-100 colour, +0x1B20/+0x1B24/+0x1B28 of the grey-86.
+std::vector<Watch> g_watches = {
+    Watch{0x833FB1E0u, {0x1AF0u}}, Watch{0x833FB1E0u, {0x1AF4u}}, Watch{0x833FB1E0u, {0x1AF8u}},
+    Watch{0x833FB1E0u, {0x1B20u}}, Watch{0x833FB1E0u, {0x1B24u}}, Watch{0x833FB1E0u, {0x1B28u}},
+};
 constexpr size_t kMaxWatches = 8;
 constexpr int kNoisyChanges = 5;
 
