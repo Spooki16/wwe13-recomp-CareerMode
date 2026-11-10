@@ -12,6 +12,10 @@
 //   - On the launcher's Classic frame rate, entrance lengths repeat exactly (CM Punk 75.9 s, Cody Rhodes 61.8 s).
 //     60 Everywhere froze the game twice and stretched entrances, so career shows run on Classic.
 //
+// Pause: the game keeps a pause flag in its globals at kPauseFlagAddress (0 = playing, 1 = paused by the player).
+// Found with the scanner over 21 pause/unpause rounds and checked live: it flips with every pause and unpause and
+// stays 0 in the pause menu's sub-menus. Paused time is left out of entrance, match and post-match lengths.
+//
 // Every event goes to the game log (tagged "[career]") and to the companion app over the pipe in career_pipe.h, as
 // one JSON object per line: {"seq":N,"t":SECONDS_SINCE_START,"event":"NAME", ...fields}.
 
@@ -31,8 +35,10 @@ void OnCinematicEnd(uint32_t return_address);
 // Publishes one event. `fields` are extra JSON members without the braces, e.g. R"("index":1,"duration":75.9)".
 void Emit(std::string_view event, std::string_view fields = {});
 
-// Called about 20 times a second by the background thread: emits match_start once the gameplay after the last
-// entrance has run long enough to be the match.
+// Called about 20 times a second by the background thread: follows the pause flag, and emits match_start once the
+// gameplay after the last entrance has run long enough (not counting pauses) to be the match.
 void Tick();
+
+constexpr uint32_t kPauseFlagAddress = 0x83408E28;
 
 }  // namespace wwe13::career

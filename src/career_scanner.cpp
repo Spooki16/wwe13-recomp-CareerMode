@@ -670,6 +670,20 @@ void BackgroundThread() {
 
 }  // namespace
 
+bool ReadGuestU32(uint32_t address, uint32_t* value) {
+  rex::memory::Memory* const memory = GuestMemory();
+  if (!memory) {
+    return false;
+  }
+  const uint8_t* const source = memory->TranslateVirtual<const uint8_t*>(address);
+  uint32_t raw = 0;
+  if (!source || !SafeCopy(&raw, source, sizeof(raw))) {
+    return false;
+  }
+  *value = SwapBe(raw);
+  return true;
+}
+
 void StartScanner() {
 #ifdef _WIN32
   std::call_once(g_started, [] { std::thread(BackgroundThread).detach(); });

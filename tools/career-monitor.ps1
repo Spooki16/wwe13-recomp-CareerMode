@@ -26,8 +26,13 @@ function Show-Event($e, [string]$line) {
     "entrance_start"   { Write-Host "$time  Entrance $($e.index) started" -ForegroundColor Cyan }
     "entrance_end"     { Write-Host "$time  Entrance $($e.index) ended  ($($e.duration) s)" -ForegroundColor Cyan }
     "match_start"      { Write-Host "$time  MATCH STARTED  (bell was $($e.after) s ago)" -ForegroundColor Yellow }
-    "match_end"        { Write-Host "$time  MATCH OVER  after $(Format-Seconds $e.match)" -ForegroundColor Yellow }
+    "match_end"        {
+      $pauses = if ($e.pauses) { "  (plus $(Format-Seconds $e.paused) paused, $($e.pauses) pause(s))" } else { "" }
+      Write-Host "$time  MATCH OVER  after $(Format-Seconds $e.match)$pauses" -ForegroundColor Yellow
+    }
     "match_summary"    { Write-Host "$time  Summary: $($e.entrances) entrance cinematic(s), $($e.entrance_time) s of entrances, match $(Format-Seconds $e.match)" -ForegroundColor Yellow }
+    "pause_start"      { Write-Host "$time  Paused ($($e.phase))" -ForegroundColor DarkYellow }
+    "pause_end"        { Write-Host "$time  Resumed after $(Format-Seconds $e.duration)" -ForegroundColor DarkYellow }
     "post_match_start" { Write-Host "$time  Post-match scene started" -ForegroundColor Magenta }
     "post_match_end"   { Write-Host "$time  Post-match scene ended  ($($e.duration) s)" -ForegroundColor Magenta }
     "cinematic_start"  { }

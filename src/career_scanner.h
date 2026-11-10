@@ -15,7 +15,13 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace wwe13::career {
+
+// Reads one big-endian 32-bit word of guest memory from any thread. False if the game's memory isn't ready yet or
+// the page faults.
+bool ReadGuestU32(uint32_t address, uint32_t* value);
 
 // Starts the background thread: hotkeys, scanning, and Tick() for the bridge. Safe to call more than once.
 void StartScanner();
