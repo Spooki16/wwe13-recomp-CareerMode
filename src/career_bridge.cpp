@@ -9,7 +9,8 @@
 //   match_end        match, paused, pauses          match length in seconds without pauses; time spent paused;
 //                                                   number of pauses
 //   match_summary    entrances, entrance_time, match, paused
-//   pause_start      phase                          the player paused (not reported in menus)
+//   pause_start      phase                          the player paused ("idle" when no match is being tracked, e.g.
+//                                                   a match that started without any entrance cinematic)
 //   pause_end        phase, duration                the player unpaused after `duration` seconds
 //   post_match_start
 //   post_match_end   duration                       (entrance and post-match durations leave out pauses too)
@@ -127,7 +128,7 @@ void Emit(std::string_view event, std::string_view fields) {
   static std::mutex emit_mutex;
   static uint64_t seq = 0;
   std::call_once(g_hello, [] {
-    SendLine(R"({"seq":0,"t":0.0,"event":"bridge_start","version":"phase0-4"})");
+    SendLine(R"({"seq":0,"t":0.0,"event":"bridge_start","version":"phase0-5"})");
   });
   std::lock_guard<std::mutex> lock(emit_mutex);
   ++seq;
@@ -240,15 +241,11 @@ void Tick() {
       if (paused) {
         state.pause_start = now;
         ++state.phase_pauses;
-        if (state.phase != Phase::Idle) {
-          Emit("pause_start", fmt::format(R"("phase":"{}")", PhaseName(state.phase)));
-        }
+        Emit("pause_start", fmt::format(R"("phase":"{}")", PhaseName(state.phase)));
       } else {
         const double duration = SecondsBetween(state.pause_start, now);
         state.phase_paused += duration;
-        if (state.phase != Phase::Idle) {
-          Emit("pause_end", fmt::format(R"("phase":"{}","duration":{:.1f})", PhaseName(state.phase), duration));
-        }
+        Emit("pause_end", fmt::format(R"("phase":"{}","duration":{:.1f})", PhaseName(state.phase), duration));
       }
     }
   }
