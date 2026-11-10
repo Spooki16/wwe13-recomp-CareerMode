@@ -124,6 +124,12 @@ bool IsReadable(rex::memory::Memory* memory, uint32_t address) {
   if (!heap) {
     return false;
   }
+  // The physical-memory views (0xA0000000 and up) are backed in full by the host, so any address in them can be read;
+  // their heaps don't report allocations the way the virtual heaps do (the damage counter at 0xCBA9B48C failed the
+  // check below although it reads fine).
+  if (address >= 0xA0000000u) {
+    return true;
+  }
   rex::memory::HeapAllocationInfo info{};
   if (!heap->QueryRegionInfo(address & ~0xFFFu, &info) || info.region_size == 0) {
     return false;
